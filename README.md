@@ -39,6 +39,7 @@ Installe les dépendances listées :
 Dans un CMD (clique droit sur le bureau "Ouvrir dans le terminal")  tape les commandes une après les autres suivantes : 
 
 git clone https://github.com/kripztechnics/Kalibre.git
+
 cd Kalibre
 
 python -m venv .venv
