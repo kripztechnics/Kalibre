@@ -1,6 +1,14 @@
 # KaLibre
 
-KaLibre est un petit outil de mesure acoustique et d'analyse audio (sweep ESS, estimation de délai, extraction d'IR, détection de polarité, propositions d'EQ).
+Salut à toi caleur de sonorisation. 
+
+KaLibre est un petit outil de mesure acoustique et d'analyse audio (Mise en phase de système automatique, universel et fait pour des utilisation de sono DIY).
+
+J'ai créé ce programme pour toutes ces personnes qui se lancent dans la sonorisation et le partage de musique via amplification,
+qui n'ont pas de conaissances particulières dans l'utilisation de certain logiciel type Smaart ou REW. 
+
+Je mets mon discords au cas ou il y a des demandes sur l'utilisation ou certain problème rencontrés :)
+
 
 Fonctionnalités principales
 - Génération d'un sweep ESS (balayage exponentiel)
@@ -10,11 +18,11 @@ Fonctionnalités principales
 - Profils EQ de référence et suggestions d'égalisation basiques
 
 Aperçu du fonctionnement
-Le pipeline général est :
+L'utilisation générale est la suivante :
 1. Génération d'un signal de test (sweep ESS) ou capture d'une source.
-2. Enregistrement duplex : `loopback` (référence électrique) et `mic` (capté).
+2. Mesures par le Micro
 3. Calcul spectre / fonction de transfert : $H(f)=M(f) / L(f)$ et déconvolution pour obtenir l'IR.
-4. Estimation du délai par corrélation normalisée (améliorable par GCC-PHAT).
+4. Estimation du délai par corrélation normalisée.
 5. Alignement des IR et analyse de polarité par corrélation et comparaison +B vs −B.
 
 Fichiers importants
@@ -24,50 +32,29 @@ Fichiers importants
 - `kalibre/core/signals.py` : génération de signaux, estimation du délai, utilitaires.
 - `kalibre/core/polarity_analysis.py` : logique de comparaison de polarité.
 
-Dépendances
+COMMENT L'INSTALLER ??? tu vas me dire 
+
 Installe les dépendances listées :
 
-```powershell
+Dans un CMD (clique droit sur le bureau "Ouvrir dans le terminal")  tape les commandes une après les autres suivantes : 
+
+git clone https://github.com/kripztechnics/Kalibre.git
+cd Kalibre
 python -m venv .venv
 .\.venv\Scripts\activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-```
 
-Lancer l'application
+~~ Pour lancer l'appli une fois toutes les dépendances installées : 
 
-```powershell
 python main.py
-```
 
-Construire un exécutable (Windows)
-Tu peux créer un `.exe` autonome avec PyInstaller :
+Il ne vous reste plus qu'à mesurer et envoyer la frappe. 
 
-```powershell
-python -m pip install pyinstaller
-python -m PyInstaller --onefile --windowed main.py
-```
+Bonne soirée/journée 
 
-L'exécutable sera dans `dist\main.exe`. Ne commite pas `dist/` dans le repo (utilise les Releases GitHub pour distribuer les binaires).
+Kripziii 
 
-Conseils pour mesures basses fréquences (50 Hz)
-- Utilise des sweeps plus longs et une fenêtre IR plus large (la valeur par défaut `ir_window_ms=7` est courte pour 50 Hz).
-- Moyenne (Welch) et utilisation de la cohérence améliorent la robustesse en LF.
 
-Améliorations mathématiques possibles
-- Remplacer la corrélation brute par GCC-PHAT pour estimer le délai (plus robuste au bruit).
-- Moyennage de Welch pour stabiliser l'estimation de la fonction de transfert H(f).
-- Régularisation (Tikhonov) lors de la déconvolution pour réduire le bruit dans l'IR.
 
-Bonnes pratiques Git
-- N'ajoute pas `dist/`, `build/`, `*.spec`, ni `*.exe` au repo.
-- Ajoute un `.gitignore` (exemple donné dans `.gitignore` du projet).
 
-Licence et contributions
-Ajoute un fichier `LICENSE` si tu veux expliciter la licence. Contributions bienvenues via pull requests.
-
----
-
-Si tu veux, je peux aussi :
-- ajouter un `README` en anglais, ou
-- committer ces fichiers et pousser sur GitHub pour toi (si tu veux que je crée le commit localement).
