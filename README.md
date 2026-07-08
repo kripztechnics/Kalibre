@@ -36,6 +36,12 @@ COMMENT L'INSTALLER ??? tu vas me dire
 
 Installe les dépendances listées :
 
+AVANT TOUT IL TE FAUT UNE VERSION DE GIT pour pouvoir télécharger le repos :
+
+https://git-scm.com ( télécharge la dernière version et suit le setup d'installation classique) 
+
+Une fois ceci fait tu peux télécharger le repos : 
+
 Dans un CMD (clique droit sur le bureau "Ouvrir dans le terminal")  tape les commandes une après les autres suivantes : 
 
 git clone https://github.com/kripztechnics/Kalibre.git
