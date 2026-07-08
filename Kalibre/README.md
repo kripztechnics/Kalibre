@@ -1,59 +1,26 @@
-# KaLibre
+Si tu es la c'est parce que tu as besoin de régler un système son. 
 
-Salut à toi caleur de sonorisation. 
+Ce logiciel va te permettre de faire ça de manière directe et contrôlée.
 
-KaLibre est un petit outil de mesure acoustique et d'analyse audio (Mise en phase de système automatique, universel et fait pour des utilisation de sono DIY).
+Pour se faire tu vas avoir besoin du matériel suivant :
 
-J'ai créé ce programme pour toutes ces personnes qui se lancent dans la sonorisation et le partage de musique via amplification,
-qui n'ont pas de conaissances particulières dans l'utilisation de certain logiciel type Smaart ou REW. 
+-Une carte son 2 entrées 2 sorties
+-Un micro omnidirectionel 
+-Un DSP
 
-Je mets mon discords au cas ou il y a des demandes sur l'utilisation ou certain problème rencontrés :)
+Ici peux importe votre matériel le logiciel ne fonctionne que sur des calculs qui sont fait par votre micro et votre carte son qui sont détéctés automatiquements dans le logiciel. 
+
+Tout le branchement est expliqué dans la partie branchement, il ne vous reste plus qu'à la l'effectuer et mesurer voies par voies votre systèmes (en les mutants de manières séprarée) en commençant par la partie la plus aïgue. Les delay par rapport au point découtes sont calculés directement et affichés. 
+
+Il vous faudra bien sur adapter les paramètres du sweep généré afin de faire fonctionner correctement chaque voie de votre système. 
+
+ET EVIDEMENT AVOIR FILTRÉ ET LIMITÉ CHAQUE VOIE EN AMONT. 
+
+Je ne suis pas ici pour vous expliquer ça. ET JE NE SUIS PAS RESPONSABLES DE CE QUE VOUS ALLEZ FAIRE AVEC CE LOGICIEL. 
+
+si tu as des questions voici mon discord : @kripziii
 
 
-Fonctionnalités principales
-- Génération d'un sweep ESS (balayage exponentiel)
-- Capture loopback + micro et estimation de la fonction de transfert
-- Extraction de la réponse impulsionnelle (IR) et estimation du délai acoustique
-- Détection d'inversion de polarité entre deux mesures
-- Profils EQ de référence et suggestions d'égalisation basiques
-
-Aperçu du fonctionnement
-L'utilisation générale est la suivante :
-1. Génération d'un signal de test (sweep ESS) ou capture d'une source.
-2. Mesures par le Micro
-3. Calcul spectre / fonction de transfert : $H(f)=M(f) / L(f)$ et déconvolution pour obtenir l'IR.
-4. Estimation du délai par corrélation normalisée.
-5. Alignement des IR et analyse de polarité par corrélation et comparaison +B vs −B.
-
-Fichiers importants
-- `main.py` : point d'entrée de l'application (lance l'interface).
-- `requirements.txt` : dépendances Python nécessaires.
-- `kalibre/core/sweep_analysis.py` : génération du sweep et analyse de la référence acoustique.
-- `kalibre/core/signals.py` : génération de signaux, estimation du délai, utilitaires.
-- `kalibre/core/polarity_analysis.py` : logique de comparaison de polarité.
-
-COMMENT L'INSTALLER ??? tu vas me dire 
-
-Installe les dépendances listées :
-
-Dans un CMD (clique droit sur le bureau "Ouvrir dans le terminal")  tape les commandes une après les autres suivantes : 
-
-git clone https://github.com/kripztechnics/Kalibre.git
-cd Kalibre
-python -m venv .venv
-.\.venv\Scripts\activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-
-~~ Pour lancer l'appli une fois toutes les dépendances installées : 
-
-python main.py
-
-Il ne vous reste plus qu'à mesurer et envoyer la frappe. 
-
-Bonne soirée/journée 
-
-Kripziii 
 
 
 
