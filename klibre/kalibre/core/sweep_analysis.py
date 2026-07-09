@@ -11,15 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from kalibre.core.signals import _parabolic_peak_index
-
-
-SWEEP_PRESETS: dict[str, tuple[float, float, float]] = {
-    "Complet (20 Hz – 20 kHz)": (20.0, 20_000.0, 5.0),
-    "Sub (20 – 200 Hz)": (20.0, 200.0, 2.5),
-    "Medium (80 Hz – 5 kHz)": (80.0, 5_000.0, 3.0),
-    "Aigu (1 – 20 kHz)": (1_000.0, 20_000.0, 2.5),
-}
+from kalibre.core.signals import _parabolic_peak_index, estimate_delay_from_phase
 
 
 @dataclass(frozen=True)
@@ -148,6 +140,20 @@ def analyze_acoustic_reference(
 
     freqs_out = freqs_mag[mask]
     mean_coh = float(np.mean(coh_interp[mask]))
+
+    # Improve delay estimate using phase slope regression if possible
+    phase_band = phase_deg[mask]
+    coh_band = coh_interp[mask]
+    phase_delay_ms, phase_r2 = estimate_delay_from_phase(
+        freqs_out, phase_band, coh_band, f_min=f_min, f_max=f_max
+    )
+
+    # Choose phase-based delay if fit quality and coherence are acceptable
+    # Conservative thresholds: require R2 >= 0.5 and mean coherence >= 0.15
+    if phase_r2 >= 0.5 and mean_coh >= 0.15:
+        delay_ms = phase_delay_ms
+        # boost confidence if phase fit is good
+        confidence = float(np.clip(max(confidence, phase_r2), 0.0, 1.0))
 
     ir_time_ms = np.arange(len(ir)) * 1000.0 / sample_rate
 

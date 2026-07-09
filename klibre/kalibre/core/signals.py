@@ -283,6 +283,111 @@ def estimate_delay_ms(
     return estimate_delay(reference, measured, sample_rate, max_delay_ms).delay_ms
 
 
+def estimate_delay_from_phase(
+    freqs: NDArray[np.float64],
+    phase_deg: NDArray[np.float64],
+    coherence: NDArray[np.float64] | None = None,
+    *,
+    f_min: float | None = None,
+    f_max: float | None = None,
+    weight_power: float = 2.0,
+    min_points: int = 8,
+) -> tuple[float, float]:
+    """Estimate acoustic delay from phase slope (degrees vs Hz).
+
+    Performs an (optionally) coherence-weighted linear regression on the
+    unwrapped phase (in degrees) against frequency (Hz). Returns a tuple
+    `(delay_ms, r2)` where `delay_ms` is the estimated delay in milliseconds
+    (positive = mic delayed after reference) and `r2` is the weighted
+    coefficient of determination (0..1) indicating fit quality.
+
+    The slope 'a' in deg/Hz relates to delay by a = -360 * delay_s.
+    """
+    if len(freqs) == 0 or len(phase_deg) == 0:
+        return 0.0, 0.0
+
+    freqs = np.asarray(freqs, dtype=np.float64)
+    phase_deg = np.asarray(phase_deg, dtype=np.float64)
+
+    mask = np.isfinite(freqs) & np.isfinite(phase_deg)
+    if f_min is not None:
+        mask &= freqs >= float(f_min)
+    if f_max is not None:
+        mask &= freqs <= float(f_max)
+    if coherence is not None:
+        coh = np.asarray(coherence, dtype=np.float64)
+        mask &= np.isfinite(coh)
+    else:
+        coh = None
+
+    if np.count_nonzero(mask) < max(3, min_points):
+        return 0.0, 0.0
+
+    f = freqs[mask]
+    ph = phase_deg[mask]
+    ph_unwrapped = np.rad2deg(np.unwrap(np.deg2rad(ph)))
+
+    if coh is not None:
+        w = np.clip(coh[mask], 0.0, 1.0) ** float(weight_power)
+        # avoid zero weights
+        w_sum = float(np.sum(w)) + 1e-12
+        w = w / w_sum
+    else:
+        w = None
+
+    # Weighted linear regression (degree 1)
+    try:
+        if w is None:
+            coef = np.polyfit(f, ph_unwrapped, 1)
+            slope, intercept = float(coef[0]), float(coef[1])
+            yhat = slope * f + intercept
+            resid = ph_unwrapped - yhat
+            ss_res = float(np.sum(resid * resid))
+            ss_tot = float(np.sum((ph_unwrapped - float(np.mean(ph_unwrapped))) ** 2)) + 1e-12
+        else:
+            # use numpy.polyfit with w as weights (it expects sigma inversely)
+            coef = np.polyfit(f, ph_unwrapped, 1, w=w)
+            slope, intercept = float(coef[0]), float(coef[1])
+            yhat = slope * f + intercept
+            ss_res = float(np.sum(w * (ph_unwrapped - yhat) ** 2))
+            mean_w = float(np.sum(w * ph_unwrapped))
+            ss_tot = float(np.sum(w * (ph_unwrapped - mean_w) ** 2)) + 1e-12
+
+        r2 = max(0.0, 1.0 - ss_res / ss_tot)
+        delay_s = -slope / 360.0
+        delay_ms = float(delay_s * 1000.0)
+
+        # One robust iteration: remove large residuals and refit if many points
+        if len(f) >= 12:
+            sigma = float(np.sqrt(ss_res / len(f)))
+            if sigma > 1e-6:
+                good = np.abs(ph_unwrapped - yhat) <= (3.0 * sigma)
+                if np.count_nonzero(good) >= max(3, int(0.7 * len(f))):
+                    f2 = f[good]
+                    ph2 = ph_unwrapped[good]
+                    w2 = (w[good] if w is not None else None)
+                    if w2 is None:
+                        coef2 = np.polyfit(f2, ph2, 1)
+                        slope2 = float(coef2[0])
+                    else:
+                        coef2 = np.polyfit(f2, ph2, 1, w=w2)
+                        slope2 = float(coef2[0])
+                    delay_ms = -slope2 / 360.0 * 1000.0
+                    # recompute simple r2 on trimmed data
+                    yhat2 = slope2 * f2 + float(coef2[1])
+                    if w2 is None:
+                        ss_res2 = float(np.sum((ph2 - yhat2) ** 2))
+                        ss_tot2 = float(np.sum((ph2 - float(np.mean(ph2))) ** 2)) + 1e-12
+                    else:
+                        ss_res2 = float(np.sum(w2 * (ph2 - yhat2) ** 2))
+                        ss_tot2 = float(np.sum(w2 * (ph2 - float(np.sum(w2 * ph2))) ** 2)) + 1e-12
+                    r2 = max(0.0, 1.0 - ss_res2 / ss_tot2)
+
+        return delay_ms, float(np.clip(r2, 0.0, 1.0))
+    except Exception:
+        return 0.0, 0.0
+
+
 def simulate_loopback_capture(
     emitted: NDArray[np.float64],
     acoustic_delay_ms: float,

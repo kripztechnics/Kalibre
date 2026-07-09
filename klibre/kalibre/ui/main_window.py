@@ -10,7 +10,7 @@ import traceback
 from dataclasses import dataclass, field
 
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QThread, QObject, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -76,7 +76,6 @@ from kalibre.core.signals import (
     suggest_eq_from_diff,
 )
 from kalibre.core.sweep_analysis import (
-    SWEEP_PRESETS,
     SweepAnalysis,
     analyze_acoustic_reference,
     generate_ess_sweep,
@@ -111,6 +110,51 @@ IR_COMPARE_COLORS = [
 ]
 
 
+# Worker moved to module level so MainWindow methods can reference it directly.
+class _ContinuousWorker(QObject):
+    """Worker that runs continuous play+capture in a background QThread.
+
+    Emits `capture_ready` with the `CaptureResult` after each acquisition.
+    """
+
+    capture_ready = pyqtSignal(object)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, engine: AudioEngine, signal: np.ndarray, interval_s: float = 1.0):
+        super().__init__()
+        self._engine = engine
+        self._signal = signal
+        self._interval = interval_s
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            while not self._stop:
+                # Each acquisition can be interrupted by engine via stop_check
+                try:
+                    cap = self._engine.play_and_capture(self._signal, stop_check=lambda: self._stop)
+                except MeasurementAborted:
+                    break
+                except Exception as exc:
+                    self.error.emit(str(exc))
+                    break
+                self.capture_ready.emit(cap)
+                # small pause to yield CPU and avoid tight loop
+                QThread.msleep(int(max(10, self._interval * 1000)))
+        finally:
+            try:
+                import sounddevice as sd
+
+                sd.stop()
+            except Exception:
+                pass
+            self.finished.emit()
+
+
 # ---------------------------------------------------------------------------
 # Modèle de session
 # ---------------------------------------------------------------------------
@@ -130,7 +174,9 @@ class ChannelMeasurement:
     freqs: np.ndarray | None = None
     magnitude_db_rel: np.ndarray | None = None
     coherence: np.ndarray | None = None
+    phase_deg: np.ndarray | None = None
     curve_color: str = COLOR_MIC
+    visible: bool = True
 
 
 @dataclass
@@ -182,11 +228,14 @@ class MainWindow(QMainWindow):
         self._live_timer.setInterval(200)
         self._live_timer.timeout.connect(self._refresh_live_time_plot)
 
-        self._apply_sweep_preset()
         self._draw_eq_reference_curves()
         self.statusBar().showMessage(
             f"État : prêt — {len(enumerate_active_usb_devices())} interface(s) USB active(s)"
         )
+
+        # Live measurement background thread state
+        self._live_thread: QThread | None = None
+        self._live_worker: QObject | None = None
 
     # ------------------------------------------------------------------
     # UI
@@ -264,10 +313,6 @@ class MainWindow(QMainWindow):
         )
         form.addRow("Forme d'onde :", self.cmb_waveform)
 
-        self.cmb_sweep_preset = QComboBox()
-        self.cmb_sweep_preset.addItems(list(SWEEP_PRESETS.keys()))
-        form.addRow("Plage sweep :", self.cmb_sweep_preset)
-
         self.lbl_f_min = QLabel("Sweep min :")
         self.spin_f_min = QDoubleSpinBox()
         self.spin_f_min.setRange(10, 20_000)
@@ -284,8 +329,8 @@ class MainWindow(QMainWindow):
 
         self.lbl_ir_window = QLabel("Fenêtre IR :")
         self.spin_ir_window = QDoubleSpinBox()
-        self.spin_ir_window.setRange(2.0, 30.0)
-        self.spin_ir_window.setValue(7.0)
+        self.spin_ir_window.setRange(2.0, 150.0)
+        self.spin_ir_window.setValue(15.0)
         self.spin_ir_window.setSingleStep(0.5)
         self.spin_ir_window.setSuffix(" ms")
         self.spin_ir_window.setToolTip(
@@ -308,7 +353,7 @@ class MainWindow(QMainWindow):
         form.addRow("Amplitude :", self.spin_amplitude)
 
         self.spin_duration = QDoubleSpinBox()
-        self.spin_duration.setRange(0.1, 5.0)
+        self.spin_duration.setRange(0.1, 20.0)
         self.spin_duration.setSingleStep(0.1)
         self.spin_duration.setValue(1.0)
         self.spin_duration.setSuffix(" s")
@@ -330,8 +375,12 @@ class MainWindow(QMainWindow):
         self.btn_generate.setStyleSheet(f"background: {BTN_PRIMARY}; font-weight: bold;")
         self.btn_measure = QPushButton("Mesurer voie")
         self.btn_measure.setStyleSheet(f"background: {BTN_SUCCESS}; font-weight: bold;")
+        self.btn_live = QPushButton("Live ON")
+        self.btn_live.setCheckable(True)
+        self.btn_live.setStyleSheet(f"background: #2b8cff; color: white; font-weight: bold;")
         btn_row.addWidget(self.btn_generate)
         btn_row.addWidget(self.btn_measure)
+        btn_row.addWidget(self.btn_live)
         form.addRow("", btn_row)
 
         sweep_hint = QLabel(
@@ -463,9 +512,9 @@ class MainWindow(QMainWindow):
         box = QGroupBox("Alignement — delays")
         layout = QVBoxLayout(box)
 
-        self.tbl_delays = QTableWidget(0, 5)
+        self.tbl_delays = QTableWidget(0, 6)
         self.tbl_delays.setHorizontalHeaderLabels(
-            ["Voie", "Sortie", "Delay", "Rel.", "Réf."]
+            ["Voie", "Sortie", "Delay", "Rel.", "Aff.", "Réf."]
         )
         self.tbl_delays.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tbl_delays.setMaximumHeight(120)
@@ -598,12 +647,43 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.plot_noise_fft)
 
-        hint = QLabel(
-            "Vue brute pour vérifier niveaux et spectre — le délai reste calculé en arrière-plan."
+        self.plot_noise_history = PlotCard(
+            "Évolution magnitude — historique de mesure",
+            log_x=True,
+            xlabel="Fréquence (Hz)",
+            ylabel="Magnitude (dB)",
+            min_canvas_height=260,
+            x_default=(20.0, 2_000.0),
+            y_default=(-40.0, 10.0),
+            allow_trend=False,
         )
-        hint.setStyleSheet(f"color: {TEXT_DIM}; font-size: 9pt;")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        layout.addWidget(self.plot_noise_history)
+
+        self.plot_noise_phase = PlotCard(
+            "Phase déroulée — bruit / sweep",
+            log_x=True,
+            xlabel="Fréquence (Hz)",
+            ylabel="Phase (°)",
+            min_canvas_height=260,
+            x_default=(20.0, 2_000.0),
+            y_default=(-150.0, 200.0),
+            allow_trend=False,
+        )
+        # Default: keep phase Y-limits fixed so measurements don't rescale them.
+        try:
+            self.plot_noise_phase.settings.chk_auto_y.setChecked(False)
+            self.plot_noise_phase.settings._read_into_config()
+        except Exception:
+            pass
+        # Also keep X axis fixed by default for phase plot
+        try:
+            self.plot_noise_phase.settings.chk_auto_x.setChecked(False)
+            self.plot_noise_phase.settings._read_into_config()
+        except Exception:
+            pass
+        layout.addWidget(self.plot_noise_phase)
+
+        # hint label removed per user request
         layout.addStretch()
 
         return self._plot_scroll(content)
@@ -800,6 +880,8 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_generate.clicked.connect(self._on_generate)
         self.btn_measure.clicked.connect(self._on_measure)
+        # Use clicked (with confirmation) to start/stop live worker — avoid toggled handler
+        self.btn_live.clicked.connect(self._on_live_clicked)
         self.btn_clear_meas.clicked.connect(self._on_clear_selected_measurement)
         self.btn_clear_all_meas.clicked.connect(self._on_clear_all_measurements)
         self.btn_save_measurement.clicked.connect(self._on_save_measurement)
@@ -810,7 +892,6 @@ class MainWindow(QMainWindow):
         self.cmb_output.currentIndexChanged.connect(self._sync_input_to_output_device)
         self.chk_live.toggled.connect(self._on_live_toggled)
         self.cmb_waveform.currentIndexChanged.connect(self._update_waveform_fields)
-        self.cmb_sweep_preset.currentIndexChanged.connect(self._apply_sweep_preset)
         self.cmb_sample_rate.currentIndexChanged.connect(self._sync_sample_rate_from_ui)
         self.chk_show_all_devices.toggled.connect(self._refresh_audio_devices)
 
@@ -820,6 +901,8 @@ class MainWindow(QMainWindow):
         self.plot_transfer.settings_changed.connect(self._draw_transfer_plot)
         self.plot_noise_time.settings_changed.connect(self._draw_noise_time_plot)
         self.plot_noise_fft.settings_changed.connect(self._draw_noise_fft_plot)
+        self.plot_noise_history.settings_changed.connect(self._draw_noise_history_plot)
+        self.plot_noise_phase.settings_changed.connect(self._draw_noise_phase_plot)
         self.plot_sine_time.settings_changed.connect(self._draw_sine_time_plot)
         self.plot_sine_fft.settings_changed.connect(self._draw_sine_fft_plot)
         self.plot_eq.settings_changed.connect(self._on_analyze_eq)
@@ -827,6 +910,92 @@ class MainWindow(QMainWindow):
         self.plot_polarity_ir.settings_changed.connect(self._draw_polarity_ir_plot)
         self.plot_polarity_sum.settings_changed.connect(self._draw_polarity_sum_plot)
         self.plot_polarity_phase.settings_changed.connect(self._draw_polarity_phase_plot)
+        self.tbl_delays.cellChanged.connect(self._on_delay_table_cell_changed)
+
+    def _on_live_clicked(self) -> None:
+        # Confirm before enabling live noise measurement. Start/stop worker accordingly.
+        if self.btn_live.isChecked():
+            r = QMessageBox.question(
+                self,
+                "Démarrer Live",
+                "Démarrer la mesure continue (bruit aléatoire) ? Assurez-vous des niveaux avant d'activer.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if r != QMessageBox.StandardButton.Yes:
+                self.btn_live.setChecked(False)
+                return
+            # start the continuous live worker
+            self.statusBar().showMessage("DEBUG: _on_live_clicked -> starting live")
+            print("DEBUG: _on_live_clicked -> starting live")
+            self._start_live_worker()
+        else:
+            # stop the worker if toggled off
+            self._stop_live_worker()
+
+    def _start_live_worker(self) -> None:
+        try:
+            self._stop_audio()
+            self._stop_requested = False
+            engine = self._build_audio_engine()
+            signal = self._build_test_signal()
+            # Create worker and thread
+            worker = _ContinuousWorker(engine, signal, interval_s=max(0.5, float(self.spin_duration.value())))
+            thread = QThread(self)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.capture_ready.connect(self._on_continuous_capture)
+            worker.error.connect(lambda s: QMessageBox.critical(self, "Erreur Live", s))
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.start()
+            self._live_thread = thread
+            self._live_worker = worker
+            self.lbl_state.setText("État : Live ON — ARRÊTER pour couper")
+            self.statusBar().showMessage("Mesure continue activée")
+            # keep generate/measure buttons disabled while live active
+            self._set_busy(True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Erreur Live", str(exc))
+            self.btn_live.setChecked(False)
+
+    def _stop_live_worker(self) -> None:
+        if isinstance(self._live_worker, _ContinuousWorker):
+            try:
+                self._live_worker.stop()
+            except Exception:
+                pass
+        if self._live_thread is not None:
+            self._live_thread.quit()
+            self._live_thread.wait(500)
+        self._live_thread = None
+        self._live_worker = None
+        self._set_busy(False)
+        self.lbl_state.setText("État : prêt")
+        self.statusBar().showMessage("Live arrêté")
+
+    def _on_continuous_capture(self, capture) -> None:
+        try:
+            loopback, mic = capture.loopback, capture.mic
+            n = min(len(loopback), len(mic))
+            loopback = loopback[:n]
+            mic = mic[:n]
+            self.state.loopback_signal = loopback
+            self.state.mic_signal = mic
+            self.state.last_delay_ms = None
+            f_min, f_max, ir_win = self._sweep_band()
+            analysis = analyze_acoustic_reference(
+                loopback,
+                mic,
+                self.state.sample_rate,
+                f_min=f_min,
+                f_max=f_max,
+                ir_window_ms=ir_win,
+            )
+            self.state.sweep_analysis = analysis
+            self._refresh_all_plots()
+        except Exception as exc:
+            traceback.print_exc()
 
     def _update_waveform_fields(self) -> None:
         kind = self._waveform_kind()
@@ -837,7 +1006,6 @@ class MainWindow(QMainWindow):
         self.spin_f0.setVisible(is_sine)
 
         for w in (
-            self.cmb_sweep_preset,
             self.lbl_f_min,
             self.spin_f_min,
             self.lbl_f_max,
@@ -846,9 +1014,6 @@ class MainWindow(QMainWindow):
             self.spin_ir_window,
         ):
             w.setVisible(is_sweep)
-
-        if is_sweep:
-            self._apply_sweep_preset()
 
         self._sync_right_tab()
 
@@ -861,15 +1026,6 @@ class MainWindow(QMainWindow):
             self.right_tabs.setCurrentIndex(1)
         elif kind.startswith("Sinus"):
             self.right_tabs.setCurrentIndex(2)
-
-    def _apply_sweep_preset(self) -> None:
-        if not self._waveform_kind().startswith("Sweep"):
-            return
-        key = self.cmb_sweep_preset.currentText()
-        f_min, f_max, duration = SWEEP_PRESETS.get(key, (20.0, 20_000.0, 5.0))
-        self.spin_f_min.setValue(f_min)
-        self.spin_f_max.setValue(f_max)
-        self.spin_duration.setValue(duration)
 
     def _waveform_kind(self) -> str:
         return self.cmb_waveform.currentText()
@@ -1051,6 +1207,8 @@ class MainWindow(QMainWindow):
             return
 
         self._refresh_all_plots()
+
+
 
     def _on_measure(self) -> None:
         """
@@ -1295,6 +1453,7 @@ class MainWindow(QMainWindow):
         freqs: np.ndarray | None = None
         magnitude_db_rel: np.ndarray | None = None
         coherence: np.ndarray | None = None
+        phase_deg: np.ndarray | None = None
 
         if analysis is not None and len(analysis.ir) > 0:
             ir_time = np.array(analysis.ir_time_ms, copy=True)
@@ -1306,6 +1465,7 @@ class MainWindow(QMainWindow):
                 copy=True,
             )
             coherence = np.array(analysis.coherence, copy=True)
+            phase_deg = np.array(analysis.phase_deg, copy=True)
 
         self.state.measurements.append(
             ChannelMeasurement(
@@ -1319,12 +1479,25 @@ class MainWindow(QMainWindow):
                 freqs=freqs,
                 magnitude_db_rel=magnitude_db_rel,
                 coherence=coherence,
+                phase_deg=phase_deg,
                 curve_color=self._next_ir_color(),
+                visible=True,
             )
         )
         self._refresh_delay_table()
         self._refresh_polarity_selectors()
         return True
+
+    def _on_delay_table_cell_changed(self, row: int, column: int) -> None:
+        if column != 4 or row < 0 or row >= len(self.state.measurements):
+            return
+
+        item = self.tbl_delays.item(row, column)
+        if item is None:
+            return
+
+        self.state.measurements[row].visible = item.checkState() == Qt.CheckState.Checked
+        self._refresh_all_plots()
 
     def _reference_absolute_delay(self) -> float:
         for m in self.state.measurements:
@@ -1333,6 +1506,7 @@ class MainWindow(QMainWindow):
         return 0.0
 
     def _refresh_delay_table(self) -> None:
+        self.tbl_delays.blockSignals(True)
         self.tbl_delays.setRowCount(len(self.state.measurements))
         ref_abs = self._reference_absolute_delay()
 
@@ -1344,14 +1518,40 @@ class MainWindow(QMainWindow):
                 rel = m.absolute_delay_ms - ref_abs
                 proc_delay = rel  # consigne à entrer dans le DSP
 
-            self.tbl_delays.setItem(row, 0, QTableWidgetItem(m.name))
-            self.tbl_delays.setItem(row, 1, QTableWidgetItem(m.processor_out))
-            self.tbl_delays.setItem(row, 2, QTableWidgetItem(f"{proc_delay:.2f}"))
-            self.tbl_delays.setItem(row, 3, QTableWidgetItem(f"{rel:+.2f}"))
-            ref_item = QTableWidgetItem("★" if m.is_reference else "")
-            ref_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.tbl_delays.setItem(row, 4, ref_item)
+            name_item = QTableWidgetItem(m.name)
+            name_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            self.tbl_delays.setItem(row, 0, name_item)
 
+            out_item = QTableWidgetItem(m.processor_out)
+            out_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            self.tbl_delays.setItem(row, 1, out_item)
+
+            delay_item = QTableWidgetItem(f"{proc_delay:.2f}")
+            delay_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            self.tbl_delays.setItem(row, 2, delay_item)
+
+            rel_item = QTableWidgetItem(f"{rel:+.2f}")
+            rel_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            self.tbl_delays.setItem(row, 3, rel_item)
+
+            visible_item = QTableWidgetItem()
+            visible_item.setFlags(
+                Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            visible_item.setCheckState(
+                Qt.CheckState.Checked if m.visible else Qt.CheckState.Unchecked
+            )
+            visible_item.setText("")
+            self.tbl_delays.setItem(row, 4, visible_item)
+
+            ref_item = QTableWidgetItem("★" if m.is_reference else "")
+            ref_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+            ref_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.tbl_delays.setItem(row, 5, ref_item)
+
+        self.tbl_delays.blockSignals(False)
         self._refresh_polarity_selectors()
 
     def _on_clear_selected_measurement(self) -> None:
@@ -1430,6 +1630,8 @@ class MainWindow(QMainWindow):
         self._draw_transfer_plot()
         self._draw_noise_time_plot()
         self._draw_noise_fft_plot()
+        self._draw_noise_history_plot()
+        self._draw_noise_phase_plot()
         self._draw_sine_time_plot()
         self._draw_sine_fft_plot()
         if self.state.sweep_analysis or (
@@ -1444,7 +1646,7 @@ class MainWindow(QMainWindow):
         x_max = 15.0
 
         for m in self.state.measurements:
-            if m.ir is None or m.ir_time_ms is None or len(m.ir) == 0:
+            if not m.visible or m.ir is None or m.ir_time_ms is None or len(m.ir) == 0:
                 continue
             has_saved = True
             t = m.ir_time_ms
@@ -1468,15 +1670,8 @@ class MainWindow(QMainWindow):
         analysis = self.state.sweep_analysis
 
         if not has_saved:
-            ax.text(
-                0.5,
-                0.5,
-                "Mesurez plusieurs positions\npour comparer les réponses IR",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color=TEXT_DIM,
-            )
+            # no saved curves — draw empty axes without descriptive text
+            self.plot_ir.apply_view(ax)
             self.plot_ir.draw()
             return
 
@@ -1486,7 +1681,10 @@ class MainWindow(QMainWindow):
             ax.axvspan(peak_t, win_end, color=COLOR_REF, alpha=0.1, label="Fenêtre IR")
             x_max = max(x_max, min(float(analysis.ir_time_ms[-1]), max(win_end * 1.4, 15.0)))
 
-        self.plot_ir._default_x = (0.0, x_max)
+        # Respect user's manual X axis: only update default when auto_x is enabled
+        cfg_ir = self.plot_ir.view_config
+        if cfg_ir.auto_x:
+            self.plot_ir._default_x = (0.0, x_max)
         self.plot_ir.apply_view(ax)
         ax.legend(loc="upper right", fontsize=8, facecolor=BG_PANEL, edgecolor=BORDER)
         self.plot_ir.draw()
@@ -1511,15 +1709,8 @@ class MainWindow(QMainWindow):
         mic = self.state.mic_signal
 
         if t is None or len(mic) == 0 or not np.any(mic):
-            ax.text(
-                0.5,
-                0.5,
-                empty_message,
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color=TEXT_DIM,
-            )
+            # empty time plot — don't draw descriptive text
+            plot.apply_view(ax)
             plot.draw()
             return
 
@@ -1537,7 +1728,10 @@ class MainWindow(QMainWindow):
                 label=f"Délai {delay:.2f} ms",
             )
 
-        plot._default_x = (0.0, min(float(t[n - 1]), 500.0))
+        # Only adjust default view if auto_x is enabled
+        cfg_time = plot.view_config
+        if cfg_time.auto_x:
+            plot._default_x = (0.0, min(float(t[n - 1]), 500.0))
         plot.apply_view(ax)
         ax.legend(loc="upper right", fontsize=8, facecolor=BG_PANEL, edgecolor=BORDER)
         plot.draw()
@@ -1549,15 +1743,8 @@ class MainWindow(QMainWindow):
         mic = self.state.mic_signal
 
         if len(mic) == 0 or not np.any(mic):
-            ax.text(
-                0.5,
-                0.5,
-                empty_message,
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color=TEXT_DIM,
-            )
+            # empty FFT plot — keep axes but no descriptive text
+            plot.apply_view(ax)
             plot.draw()
             return
 
@@ -1600,6 +1787,158 @@ class MainWindow(QMainWindow):
             empty_message="FFT après mesure bruit",
         )
 
+    def _draw_noise_history_plot(self) -> None:
+        ax = self.plot_noise_history.axes
+        self.plot_noise_history.prepare_replot(log_x=True)
+
+        analysis = self.state.sweep_analysis
+        saved = False
+        freq_values: list[np.ndarray] = []
+
+        for idx, m in enumerate(self.state.measurements):
+            if not m.visible or m.freqs is None or m.magnitude_db_rel is None or len(m.freqs) == 0:
+                continue
+            saved = True
+            alpha = 0.6 if idx < len(self.state.measurements) - 1 else 1.0
+            ax.plot(
+                m.freqs,
+                m.magnitude_db_rel,
+                color=m.curve_color,
+                linewidth=1.1,
+                alpha=alpha,
+                label=m.name,
+            )
+            freq_values.append(m.magnitude_db_rel)
+
+        if analysis is not None and len(analysis.freqs) > 0:
+            saved = True
+            current_mag = analysis.magnitude_db - np.max(analysis.magnitude_db)
+            ax.plot(
+                analysis.freqs,
+                current_mag,
+                color=COLOR_LIVE,
+                linewidth=2.0,
+                linestyle="--",
+                alpha=0.95,
+                label="Dernière mesure",
+            )
+            freq_values.append(current_mag)
+
+        if not saved:
+            # empty history — don't display descriptive text
+            self.plot_noise_history.apply_view(ax)
+            self.plot_noise_history.draw()
+            return
+
+        cfg_hist = self.plot_noise_history.view_config
+        if cfg_hist.auto_x:
+            self.plot_noise_history._default_x = (self.spin_f_min.value(), self.spin_f_max.value())
+        self.plot_noise_history.apply_view(ax)
+
+        if freq_values:
+            all_values = np.concatenate(freq_values)
+            y_lo = float(np.percentile(all_values, 5)) - 6
+            y_hi = float(np.percentile(all_values, 95)) + 3
+            # Programmatic set — do not treat as user interactive change
+            try:
+                self.plot_noise_history._suppress_callbacks = True
+            except Exception:
+                pass
+            try:
+                ax.set_ylim(y_lo, y_hi)
+            finally:
+                try:
+                    self.plot_noise_history._suppress_callbacks = False
+                except Exception:
+                    pass
+
+        ax.legend(loc="upper right", fontsize=7, facecolor=BG_PANEL, edgecolor=BORDER)
+        self.plot_noise_history.draw()
+
+    def _draw_noise_phase_plot(self) -> None:
+        ax = self.plot_noise_phase.axes
+        self.plot_noise_phase.prepare_replot(log_x=True)
+
+        analysis = self.state.sweep_analysis
+        saved = False
+        phase_values: list[np.ndarray] = []
+
+        for idx, m in enumerate(self.state.measurements):
+            if (
+                not m.visible
+                or m.freqs is None
+                or m.phase_deg is None
+                or len(m.freqs) == 0
+            ):
+                continue
+            saved = True
+            # Unwrap phase then remove delay-induced linear term relative to reference
+            phase_unwrapped = np.rad2deg(np.unwrap(np.deg2rad(m.phase_deg)))
+            ref_abs = self._reference_absolute_delay()
+            # phase shift due to delay (deg) = -360 * f * delay_s
+            # To remove delay effect, add +360 * f * delay (in seconds)
+            delay_diff_s = (m.absolute_delay_ms - ref_abs) / 1000.0
+            corrected = phase_unwrapped + 360.0 * m.freqs * delay_diff_s
+            alpha = 0.5 if idx < len(self.state.measurements) - 1 else 1.0
+            ax.plot(
+                m.freqs,
+                corrected,
+                color=m.curve_color,
+                linewidth=1.1,
+                alpha=alpha,
+                label=m.name,
+            )
+            phase_values.append(corrected)
+
+        if analysis is not None and len(analysis.freqs) > 0:
+            saved = True
+            current_phase = np.rad2deg(np.unwrap(np.deg2rad(analysis.phase_deg)))
+            ref_abs = self._reference_absolute_delay()
+            delay_diff_s = (analysis.delay_ms - ref_abs) / 1000.0
+            corrected_current = current_phase + 360.0 * analysis.freqs * delay_diff_s
+            ax.plot(
+                analysis.freqs,
+                corrected_current,
+                color=COLOR_LIVE,
+                linewidth=2.0,
+                linestyle="--",
+                alpha=0.95,
+                label="Dernière mesure",
+            )
+            phase_values.append(corrected_current)
+
+        if not saved:
+            # empty phase plot — don't display descriptive text
+            self.plot_noise_phase.apply_view(ax)
+            self.plot_noise_phase.draw()
+            return
+
+        cfg_ph = self.plot_noise_phase.view_config
+        if cfg_ph.auto_x:
+            self.plot_noise_phase._default_x = (self.spin_f_min.value(), self.spin_f_max.value())
+        self.plot_noise_phase.apply_view(ax)
+
+        # Only auto-adjust Y when auto_y is enabled; otherwise keep user's/ default limits
+        if cfg_ph.auto_y and phase_values:
+            all_values = np.concatenate(phase_values)
+            y_lo = float(np.percentile(all_values, 5)) - 30
+            y_hi = float(np.percentile(all_values, 95)) + 30
+            try:
+                self.plot_noise_phase._suppress_callbacks = True
+            except Exception:
+                pass
+            try:
+                ax.set_ylim(y_lo, y_hi)
+            finally:
+                try:
+                    self.plot_noise_phase._suppress_callbacks = False
+                except Exception:
+                    pass
+
+        ax.axhline(0.0, color=TEXT_DIM, linewidth=0.8, linestyle=":")
+        ax.legend(loc="upper right", fontsize=7, facecolor=BG_PANEL, edgecolor=BORDER)
+        self.plot_noise_phase.draw()
+
     def _draw_sine_time_plot(self) -> None:
         self._draw_time_compare(
             self.plot_sine_time,
@@ -1630,7 +1969,7 @@ class MainWindow(QMainWindow):
         mag_values: list[np.ndarray] = []
 
         for m in self.state.measurements:
-            if m.freqs is None or m.magnitude_db_rel is None or len(m.freqs) == 0:
+            if not m.visible or m.freqs is None or m.magnitude_db_rel is None or len(m.freqs) == 0:
                 continue
             has_saved = True
             ax.plot(
@@ -1648,15 +1987,8 @@ class MainWindow(QMainWindow):
         has_live = analysis is not None and len(analysis.freqs) > 0
 
         if not has_saved and not has_live:
-            ax.text(
-                0.5,
-                0.5,
-                "Magnitude & cohérence\naprès mesure",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color=TEXT_DIM,
-            )
+            # empty transfer plot — keep axes without descriptive text
+            self.plot_transfer.apply_view(ax)
             self.plot_transfer.draw()
             return
 
@@ -1689,10 +2021,21 @@ class MainWindow(QMainWindow):
             ax2.set_ylabel("Cohérence γ²", color=COLOR_COHERENCE, labelpad=6)
             ax2.tick_params(axis="y", colors=COLOR_COHERENCE, labelsize=9)
 
-        self.plot_transfer._default_x = (x_min, x_max)
+        # Keep user's axis settings: update default only when auto_x enabled
         cfg = self.plot_transfer.view_config
         if cfg.auto_x:
-            ax.set_xlim(x_min, x_max)
+            self.plot_transfer._default_x = (x_min, x_max)
+            try:
+                self.plot_transfer._suppress_callbacks = True
+            except Exception:
+                pass
+            try:
+                ax.set_xlim(x_min, x_max)
+            finally:
+                try:
+                    self.plot_transfer._suppress_callbacks = False
+                except Exception:
+                    pass
         else:
             self.plot_transfer.apply_view(ax)
 
@@ -1700,9 +2043,29 @@ class MainWindow(QMainWindow):
             stacked = np.concatenate(mag_values)
             y_lo = float(np.percentile(stacked, 5)) - 3
             y_hi = float(np.percentile(stacked, 95)) + 6
-            ax.set_ylim(y_lo, y_hi)
+            try:
+                self.plot_transfer._suppress_callbacks = True
+            except Exception:
+                pass
+            try:
+                ax.set_ylim(y_lo, y_hi)
+            finally:
+                try:
+                    self.plot_transfer._suppress_callbacks = False
+                except Exception:
+                    pass
         elif not cfg.auto_y:
-            ax.set_ylim(cfg.y_min, cfg.y_max)
+            try:
+                self.plot_transfer._suppress_callbacks = True
+            except Exception:
+                pass
+            try:
+                ax.set_ylim(cfg.y_min, cfg.y_max)
+            finally:
+                try:
+                    self.plot_transfer._suppress_callbacks = False
+                except Exception:
+                    pass
 
         ax.legend(loc="upper right", fontsize=8, facecolor=BG_PANEL, edgecolor=BORDER)
         self.plot_transfer.draw()
@@ -1888,15 +2251,8 @@ class MainWindow(QMainWindow):
         result = self._polarity_result
 
         if result is None:
-            ax.text(
-                0.5,
-                0.5,
-                "Sélectionnez deux mesures\npuis Analyser polarité",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color=TEXT_DIM,
-            )
+            # empty polarity IR plot — no descriptive text
+            self.plot_polarity_ir.apply_view(ax)
             self.plot_polarity_ir.draw()
             return
 
@@ -1919,10 +2275,12 @@ class MainWindow(QMainWindow):
                 else f"Test {result.test_name}"
             ),
         )
-        self.plot_polarity_ir._default_x = (
-            float(result.time_ms[0]),
-            float(result.time_ms[-1]),
-        )
+        cfg_ir = self.plot_polarity_ir.view_config
+        if cfg_ir.auto_x:
+            self.plot_polarity_ir._default_x = (
+                float(result.time_ms[0]),
+                float(result.time_ms[-1]),
+            )
         self.plot_polarity_ir.apply_view(ax)
         ax.legend(loc="upper right", fontsize=8, facecolor=BG_PANEL, edgecolor=BORDER)
         self.plot_polarity_ir.draw()
@@ -1933,15 +2291,8 @@ class MainWindow(QMainWindow):
         result = self._polarity_result
 
         if result is None:
-            ax.text(
-                0.5,
-                0.5,
-                "Somme A+B vs A−B\n(détecte l'inversion 180°)",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color=TEXT_DIM,
-            )
+            # empty polarity sum plot — no descriptive text
+            self.plot_polarity_sum.apply_view(ax)
             self.plot_polarity_sum.draw()
             return
 
@@ -1961,7 +2312,9 @@ class MainWindow(QMainWindow):
             linestyle="--",
             label="A − B (si B inversé)",
         )
-        self.plot_polarity_sum._default_x = (result.f_min, result.f_max)
+        cfg_sum = self.plot_polarity_sum.view_config
+        if cfg_sum.auto_x:
+            self.plot_polarity_sum._default_x = (result.f_min, result.f_max)
         self.plot_polarity_sum.apply_view(ax)
         ax.legend(loc="upper right", fontsize=8, facecolor=BG_PANEL, edgecolor=BORDER)
         self.plot_polarity_sum.draw()
@@ -1972,15 +2325,8 @@ class MainWindow(QMainWindow):
         result = self._polarity_result
 
         if result is None:
-            ax.text(
-                0.5,
-                0.5,
-                "Phase relative\n~0° = OK · ~±180° = inversion",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                color=TEXT_DIM,
-            )
+            # empty polarity phase plot — no descriptive text
+            self.plot_polarity_phase.apply_view(ax)
             self.plot_polarity_phase.draw()
             return
 
@@ -1994,7 +2340,9 @@ class MainWindow(QMainWindow):
         ax.axhspan(-35, 35, color=BTN_SUCCESS, alpha=0.08)
         ax.axhspan(145, 180, color=COLOR_ERROR, alpha=0.08)
         ax.axhspan(-180, -145, color=COLOR_ERROR, alpha=0.08)
-        self.plot_polarity_phase._default_x = (result.f_min, result.f_max)
+        cfg_phase = self.plot_polarity_phase.view_config
+        if cfg_phase.auto_x:
+            self.plot_polarity_phase._default_x = (result.f_min, result.f_max)
         self.plot_polarity_phase.apply_view(ax)
         ax.legend(loc="upper right", fontsize=8, facecolor=BG_PANEL, edgecolor=BORDER)
         self.plot_polarity_phase.draw()
@@ -2072,6 +2420,8 @@ class MainWindow(QMainWindow):
             self.tbl_eq_suggestions.setItem(row, 1, QTableWidgetItem(str(s["freq_hz"])))
             self.tbl_eq_suggestions.setItem(row, 2, QTableWidgetItem(f"{s['gain_db']:+.1f}"))
             self.tbl_eq_suggestions.setItem(row, 3, QTableWidgetItem(str(s["q"])))
+
+ 
 
 
 def run_app() -> None:
