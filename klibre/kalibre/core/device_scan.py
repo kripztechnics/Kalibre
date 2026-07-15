@@ -55,6 +55,22 @@ def _hostapi_priority(hostapi: str) -> int:
     return 6
 
 
+def parse_pnp_device_lines(lines: list[str] | tuple[str, ...]) -> tuple[UsbPresentDevice, ...]:
+    """Parse la sortie PowerShell PnP en objets structurés, sans casser sur des lignes vides."""
+    devices: list[UsbPresentDevice] = []
+    for raw_line in lines:
+        line = str(raw_line).strip()
+        if not line or "|" not in line:
+            continue
+        name, inst = line.split("|", 1)
+        name = name.strip()
+        inst = inst.strip()
+        if not name or not inst:
+            continue
+        devices.append(UsbPresentDevice(friendly_name=name, instance_id=inst))
+    return tuple(devices)
+
+
 def _is_audio_pnp_usb(name: str) -> bool:
     """
     Filtre les faux positifs PnP (claviers, hubs, stockage…).
@@ -96,6 +112,13 @@ def _is_audio_pnp_usb(name: str) -> bool:
         "umik",
         "line",
         "spdif",
+        "usb audio",
+        "audio interface",
+        "solo",
+        "2i2",
+        "2i4",
+        "4i4",
+        "18i8",
     )
     return any(h in n for h in hints)
 
@@ -150,15 +173,7 @@ def query_present_usb_devices() -> tuple[UsbPresentDevice, ...]:
     except (OSError, subprocess.TimeoutExpired):
         return tuple()
 
-    devices: list[UsbPresentDevice] = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line or "|" not in line:
-            continue
-        name, inst = line.split("|", 1)
-        if name:
-            devices.append(UsbPresentDevice(friendly_name=name.strip(), instance_id=inst.strip()))
-    return tuple(devices)
+    return parse_pnp_device_lines(proc.stdout.splitlines())
 
 
 def clear_device_cache() -> None:
@@ -169,6 +184,8 @@ def clear_device_cache() -> None:
 def is_likely_usb(name: str, hostapi: str, present_usb: tuple[UsbPresentDevice, ...]) -> bool:
     blob = f"{name} {hostapi}".lower()
     if "usb" in blob or "uac" in blob:
+        return True
+    if any(token in blob for token in ("scarlett", "focusrite", "motu", "rme", "behringer", "presonus", "steinberg", "umc", "audio interface", "usb audio")):
         return True
     for dev in present_usb:
         if _names_match(name, dev.friendly_name):

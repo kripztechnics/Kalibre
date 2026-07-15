@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import sys
 
+from collections import deque
 from dataclasses import dataclass
+from threading import Lock
 
 
 
@@ -385,6 +387,209 @@ class AudioEngine:
         self.output_channel = max(1, output_channel)
 
         self.stereo_output = stereo_output
+
+        self._live_stream = None
+
+        self._live_signal: NDArray[np.float64] | None = None
+
+        self._live_signal_pos = 0
+
+        self._live_ring: deque[np.ndarray] = deque(maxlen=32)
+
+        self._live_lock = Lock()
+
+
+
+    def _live_stream_callback(self, indata, outdata, frames, time, status) -> None:
+
+        if self._live_signal is None:
+
+            outdata.fill(0.0)
+
+            return
+
+        with self._live_lock:
+
+            signal = self._live_signal
+
+            play_pos = self._live_signal_pos
+
+            if signal is None:
+
+                outdata.fill(0.0)
+
+                return
+
+            if signal.ndim == 1:
+
+                signal = signal.reshape(-1, 1)
+
+            n_out = outdata.shape[1]
+
+            block = np.empty((frames,), dtype=np.float32)
+
+            remaining = len(signal) - play_pos
+
+            if remaining >= frames:
+
+                block[:] = signal[play_pos : play_pos + frames, 0]
+
+                self._live_signal_pos = play_pos + frames
+
+            else:
+
+                block[:remaining] = signal[play_pos:, 0]
+
+                wrap = frames - remaining
+
+                block[remaining:] = signal[:wrap, 0]
+
+                self._live_signal_pos = wrap
+
+            if n_out > 0:
+
+                for ch in range(n_out):
+
+                    outdata[:, ch] = block
+
+            if indata.ndim == 1:
+
+                indata = indata.reshape(-1, 1)
+
+            self._live_ring.append(np.array(indata, dtype=np.float32, copy=True))
+
+
+
+    def start_live_stream(self, signal: NDArray[np.float64]) -> None:
+
+        """Démarre un flux duplex continu pour le live, sans arrêter/repartir le moteur audio à chaque chunk."""
+
+        if len(signal) == 0:
+
+            raise ValueError("Signal live vide.")
+
+        self.stop_live_stream()
+
+        duplex = find_full_duplex_index(int(self.input_device), int(self.output_device))
+
+        in_idx = self.input_device if isinstance(duplex, tuple) else duplex
+
+        out_idx = self.output_device if isinstance(duplex, tuple) else duplex
+
+        n_record = max(self.mic_channel, self.loopback_channel, 1)
+        n_output = max(1, int(self.output_channel))
+
+        sd.check_input_settings(device=in_idx, channels=n_record, samplerate=self.sample_rate)
+
+        sd.check_output_settings(device=out_idx, channels=n_output, samplerate=self.sample_rate)
+
+        self._live_signal = np.asarray(signal, dtype=np.float32).reshape(-1)
+
+        self._live_signal_pos = 0
+
+        self._live_ring.clear()
+
+        self._live_stream = sd.Stream(
+
+            device=duplex,
+
+            channels=(n_record, n_output),
+
+            samplerate=self.sample_rate,
+
+            blocksize=self.blocksize,
+
+            dtype="float32",
+
+            latency="high",
+
+            callback=self._live_stream_callback,
+
+        )
+
+        self._live_stream.start()
+
+
+
+    def poll_live_capture(self) -> CaptureResult | None:
+
+        with self._live_lock:
+
+            if len(self._live_ring) == 0:
+
+                return None
+
+            frames = np.concatenate(list(self._live_ring), axis=0)
+
+            self._live_ring.clear()
+
+        if len(frames) == 0:
+
+            return None
+
+        if frames.ndim == 1:
+
+            frames = frames.reshape(-1, 1)
+
+        if frames.shape[1] < max(self.mic_channel, self.loopback_channel):
+
+            return None
+
+        mic = frames[:, self.mic_channel - 1].astype(np.float64)
+
+        loopback = frames[:, self.loopback_channel - 1].astype(np.float64)
+
+        return CaptureResult(
+
+            loopback=loopback,
+
+            mic=mic,
+
+            sample_rate=self.sample_rate,
+
+            mic_rms=rms_to_dbfs(loopback_rms(mic)),
+
+            loopback_rms=rms_to_dbfs(loopback_rms(loopback)),
+
+            mic_peak=float(np.max(np.abs(mic))) if len(mic) else 0.0,
+
+            loopback_peak=float(np.max(np.abs(loopback))) if len(loopback) else 0.0,
+
+            duplex_device=self.input_device if self.input_device == self.output_device else (self.input_device, self.output_device),
+
+        )
+
+
+
+    def stop_live_stream(self) -> None:
+
+        with self._live_lock:
+
+            if self._live_stream is not None:
+
+                try:
+
+                    self._live_stream.stop()
+
+                except Exception:
+
+                    pass
+
+                try:
+
+                    self._live_stream.close()
+
+                except Exception:
+
+                    pass
+
+                self._live_stream = None
+
+            self._live_signal = None
+
+            self._live_signal_pos = 0
+
+            self._live_ring.clear()
 
 
 

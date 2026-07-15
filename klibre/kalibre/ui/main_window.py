@@ -245,6 +245,7 @@ class MainWindow(QMainWindow):
         self._live_phase_cross_avg: np.ndarray | None = None
         self._live_phase_transfer_avg: np.ndarray | None = None
         self._live_phase_display_hist: np.ndarray | None = None
+        self._live_phase_display_freqs: np.ndarray | None = None
         self._live_phase_y_limits: tuple[float, float] | None = None
         self._live_phase_update_counter = 0
 
@@ -1223,6 +1224,7 @@ class MainWindow(QMainWindow):
             self._live_phase_cross_avg = None
             self._live_phase_transfer_avg = None
             self._live_phase_display_hist = None
+            self._live_phase_display_freqs = None
             self._live_phase_y_limits = None
             self._live_phase_update_counter = 0
             engine = self._build_audio_engine()
@@ -2615,13 +2617,24 @@ class MainWindow(QMainWindow):
 
         # Converge the Live trace slowly so it feels like an averaged preview,
         # not a raw jittery snapshot from the latest chunk.
-        if self._live_phase_display_hist is None:
+        current_freqs = analysis.freqs.astype(np.float64, copy=True)
+        if self._live_phase_display_hist is None or self._live_phase_display_freqs is None:
             self._live_phase_display_hist = phase_corrected.astype(np.float64, copy=True)
+            self._live_phase_display_freqs = current_freqs
         else:
+            # The FFT/transfer analysis window can change length from one refresh
+            # to the next. Resample the previous averaged history onto the current
+            # frequency grid before applying the smoothing update.
+            hist_resampled = np.interp(
+                current_freqs,
+                self._live_phase_display_freqs,
+                self._live_phase_display_hist,
+            )
             alpha = 0.03
             self._live_phase_display_hist = (
-                alpha * phase_corrected + (1.0 - alpha) * self._live_phase_display_hist
+                alpha * phase_corrected + (1.0 - alpha) * hist_resampled
             )
+            self._live_phase_display_freqs = current_freqs
 
         phase_display = ((self._live_phase_display_hist + 180.0) % 360.0) - 180.0
         ax.plot(analysis.freqs, phase_display, color=COLOR_LIVE, linewidth=1.3, alpha=0.95, label="Phase Live")

@@ -141,19 +141,18 @@ def analyze_acoustic_reference(
     freqs_out = freqs_mag[mask]
     mean_coh = float(np.mean(coh_interp[mask]))
 
-    # Improve delay estimate using phase slope regression if possible
+    # Phase-based delay is only diagnostic — IR peak detection is more stable
+    # and should not be overridden by phase slope, which is sensitive to windowing
     phase_band = phase_deg[mask]
     coh_band = coh_interp[mask]
     phase_delay_ms, phase_r2 = estimate_delay_from_phase(
         freqs_out, phase_band, coh_band, f_min=f_min, f_max=f_max
     )
 
-    # Choose phase-based delay if fit quality and coherence are acceptable
-    # Conservative thresholds: require R2 >= 0.5 and mean coherence >= 0.15
-    if phase_r2 >= 0.5 and mean_coh >= 0.15:
-        delay_ms = phase_delay_ms
-        # boost confidence if phase fit is good
-        confidence = float(np.clip(max(confidence, phase_r2), 0.0, 1.0))
+    # Use IR peak-based delay (stable) — do NOT override with phase_delay_ms
+    # Phase slope fit quality can improve confidence reporting only
+    if phase_r2 >= 0.8 and mean_coh >= 0.5:
+        confidence = float(np.clip(phase_r2, 0.0, 1.0))
 
     ir_time_ms = np.arange(len(ir)) * 1000.0 / sample_rate
 
